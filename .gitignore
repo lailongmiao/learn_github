@@ -1,2 +1,5 @@
 /target
 .idea/
+temp/scripts/test_script.nu
+temp/scripts/test_script.ts
+

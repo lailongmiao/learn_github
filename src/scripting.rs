@@ -7,39 +7,50 @@ use zip::read::ZipArchive;
 use std::path::PathBuf;
 use tempfile::Builder;
 use std::io::Write;
+use defer::defer;
+use wait_timeout::ChildExt;
+use std::io::Read;
 
-pub struct Agent {
-    pub py_dir: String,
+#[derive(Default)]
+pub struct ScriptExecutor {
+    // 基本路径
     pub py_bin: String,
-    pub py_base_dir: String,
-    pub proxy: Option<String>,
-    pub program_dir: String,
-    pub nu_shell_bin: String,
+    pub nu_bin: String,
     pub deno_bin: String,
+    pub program_dir: String,
+    
+    // 临时目录
     pub win_tmp_dir: String,
+    pub win_run_as_user_tmp_dir: String,
+    
+    // 代理设置
+    pub proxy: Option<String>,  // 新增：代理设置
 }
 
-impl Agent {
+
+impl ScriptExecutor {
     pub fn get_python(&self, force: bool) {
         if self.file_exists(&self.py_bin) && !force {
             return;
         }
 
         if force {
-            fs::remove_dir_all(&self.py_base_dir).expect("Failed to remove directory");
+            if let Some(parent) = Path::new(&self.py_bin).parent() {
+                fs::remove_dir_all(parent).expect("Failed to remove directory");
+            }
         }
 
         let sleep_delay = rand::thread_rng().gen_range(1..=10);
         println!("GetPython() sleeping for {} seconds", sleep_delay);
         std::thread::sleep(std::time::Duration::new(sleep_delay as u64, 0));
 
-        // 确保 py_base_dir 存在，若不存在则创建
-        if !Path::new(&self.py_base_dir).exists() {
-            fs::create_dir_all(&self.py_base_dir).expect("Failed to create base directory");
+        // 确保父目录存在
+        if let Some(parent) = Path::new(&self.py_bin).parent() {
+            fs::create_dir_all(parent).expect("Failed to create base directory");
         }
 
-        let arch_zip = "py3.11.9_amd64.zip"; // 修改为新的文件名
-        let py_zip = Path::new(&self.py_base_dir).join(arch_zip);
+        let arch_zip = "py3.11.9_amd64.zip";
+        let py_zip = Path::new(&self.py_bin).parent().unwrap().join(arch_zip);
 
         let py_zip_clone = py_zip.clone();
         let _cleanup = std::panic::catch_unwind(move || {
@@ -75,7 +86,7 @@ impl Agent {
         response.copy_to(&mut file).expect("Failed to save zip file");
 
         // 解压前确保每个子目录都存在
-        if let Err(err) = self.unzip(&py_zip, &self.py_base_dir) {
+        if let Err(err) = self.unzip(&py_zip, &self.py_bin) {
             println!("{}", err);
         }
     }
@@ -100,7 +111,7 @@ impl Agent {
             }
 
             if file.name().ends_with('/') {
-                // 处理目录项，创建目录
+                // 处目录项，创建目录
                 fs::create_dir_all(&out_path).map_err(|e| format!("Failed to create dir: {}", e))?;
             } else {
                 let mut output_file = File::create(&out_path)
@@ -114,21 +125,19 @@ impl Agent {
     }
 
     pub fn install_nu_shell(&self, force: bool) -> Result<(), String> {
+        if self.file_exists(&self.nu_bin) && !force {
+            return Ok(());
+        }
+
+        if force && self.file_exists(&self.nu_bin) {
+            fs::remove_file(&self.nu_bin)
+                .map_err(|e| format!("Error removing nu.exe binary: {}", e))?;
+        }
+
         // 随机延迟
         let sleep_delay = rand::thread_rng().gen_range(1..=10);
         println!("InstallNuShell() sleeping for {} seconds", sleep_delay);
         std::thread::sleep(std::time::Duration::new(sleep_delay as u64, 0));
-
-        // 检查是否已安装
-        if self.file_exists(&self.nu_shell_bin) {
-            if force {
-                println!("Forced install. Removing nu.exe binary.");
-                fs::remove_file(&self.nu_shell_bin)
-                    .map_err(|e| format!("Error removing nu.exe binary: {}", e))?;
-            } else {
-                return Ok(());
-            }
-        }
 
         // 创建程序目录
         let program_bin_dir = Path::new(&self.program_dir).join("bin");
@@ -214,7 +223,7 @@ impl Agent {
         // 复制可执行文件
         fs::copy(
             tmp_dir.path().join("nu.exe"),
-            &self.nu_shell_bin
+            &self.nu_bin
         ).map_err(|e| format!("Failed to copy nu.exe: {}", e))?;
 
         Ok(())
@@ -290,7 +299,20 @@ impl Agent {
         Ok(())
     }
 
-    fn create_temp_script_file(&self, code: &str, shell: &str) -> Result<PathBuf, String> {
+    pub fn run_script(
+        &self,
+        code: &str,
+        shell: &str,
+        args: Vec<String>,
+        timeout: i32,
+        run_as_user: bool,
+        env_vars: Vec<String>,
+        nushell_enable_config: bool,
+        deno_default_permissions: &str,
+    ) -> Result<(String, String, i32), String> {
+        // 首先检查脚本环境是否已安装
+        self.check_script_environment(shell)?;
+
         // 1. 获取文件扩展名
         let extension = match shell {
             "powershell" => ".ps1",
@@ -298,11 +320,16 @@ impl Agent {
             "cmd" => ".bat",
             "nushell" => ".nu",
             "deno" => ".ts",
-            _ => return Err(format!("不支持的脚本类型: {}", shell))
+            _ => return Err(format!("不支持的脚本类型: {}", shell)),
         };
 
-        // 2. 确保临时目录存在
-        let temp_dir = PathBuf::from(&self.win_tmp_dir);
+        // 2. 根据 run_as_user 选择合适的临时目录
+        let temp_dir = if run_as_user {
+            PathBuf::from(&self.win_run_as_user_tmp_dir)
+        } else {
+            PathBuf::from(&self.win_tmp_dir)
+        };
+
         if !temp_dir.exists() {
             fs::create_dir_all(&temp_dir)
                 .map_err(|e| format!("创建临时目录失败: {}", e))?;
@@ -320,9 +347,183 @@ impl Agent {
             .write_all(code.as_bytes())
             .map_err(|e| format!("写入脚本内容失败: {}", e))?;
 
-        // 5. 转换为 PathBuf 并返回
-        let path = temp_file.into_temp_path();
-        Ok(path.to_path_buf())
+        // 5. 转为 PathBuf 并返回
+        let script_path = temp_file.into_temp_path();
+
+        // 确保临时文件会被清理
+        let _cleanup = defer(|| {
+            if let Err(e) = std::fs::remove_file(&script_path) {
+                println!("清理临时文件失败: {}", e);
+            }
+        });
+
+        // 创建一个绑定来延长临时值的生命周期
+        let path_string = script_path.to_string_lossy();
+        
+        let (exe, mut cmd_args) = match shell {
+            "powershell" => (
+                "powershell.exe",
+                vec![
+                    "-NonInteractive".to_string(),
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    path_string.to_string(),
+                ]
+            ),
+            "python" => (
+                self.py_bin.as_str(),
+                vec![path_string.to_string()]
+            ),
+            "cmd" => (
+                path_string.as_ref(),
+                Vec::new()
+            ),
+            "nushell" => {
+                if !Path::new(&self.nu_bin).exists() {
+                    return Err("Nushell executable not found".to_string());
+                }
+                let mut nushell_args = if nushell_enable_config {
+                    vec![
+                        "--config".to_string(),
+                        format!("{}/etc/nushell/config.nu", self.program_dir),
+                        "--env-config".to_string(),
+                        format!("{}/etc/nushell/env.nu", self.program_dir),
+                    ]
+                } else {
+                    vec!["--no-config-file".to_string()]
+                };
+                nushell_args.push(path_string.to_string());
+                (self.nu_bin.as_str(), nushell_args)
+            },
+            "deno" => {
+                if !Path::new(&self.deno_bin).exists() {
+                    return Err("Deno executable not found".to_string());
+                }
+                let mut deno_args = vec!["run".to_string(), "--no-prompt".to_string()];
+                
+                // 处理 Deno 权限
+                let mut found = false;
+                for env_var in &env_vars {
+                    if env_var.starts_with("DENO_PERMISSIONS=") {
+                        if let Some(permissions) = env_var.split('=').nth(1) {
+                            deno_args.extend(permissions.split_whitespace().map(String::from));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if !found && !deno_default_permissions.is_empty() {
+                    deno_args.extend(deno_default_permissions.split_whitespace().map(String::from));
+                }
+                
+                deno_args.push(path_string.to_string());
+                (self.deno_bin.as_str(), deno_args)
+            },
+            _ => return Err(format!("Unsupported shell type: {}", shell)),
+        };
+
+        // 添加额外参数
+        cmd_args.extend(args);
+
+        // 创建命令
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(&cmd_args);
+
+        // 设置环境变量
+        if !env_vars.is_empty() {
+            cmd.envs(env_vars.iter().filter_map(|var| {
+                let parts: Vec<&str> = var.split('=').collect();
+                if parts.len() == 2 {
+                    Some((parts[0], parts[1]))
+                } else {
+                    None
+                }
+            }));
+        }
+
+        // 创建管道
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        // 启动进程
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Failed to start process: {}", e))?;
+
+        // 设置超时
+        let timeout = std::time::Duration::from_secs(timeout as u64);
+
+        // 获取输出
+        let output = match child.wait_timeout(timeout)
+            .map_err(|e| format!("Error waiting for process: {}", e))? {
+            Some(status) => {
+                let stdout = String::from_utf8_lossy(&child.stdout.take()
+                    .ok_or("Failed to capture stdout")?
+                    .bytes()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed to read stdout: {}", e))?).to_string();
+                
+                let stderr = String::from_utf8_lossy(&child.stderr.take()
+                    .ok_or("Failed to capture stderr")?
+                    .bytes()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed to read stderr: {}", e))?).to_string();
+
+                let exit_code = status.code().unwrap_or(1);
+                Ok::<(String, String, i32), String>((stdout, stderr, exit_code))
+            },
+            None => {
+                // 超时处理
+                child.kill()
+                    .map_err(|e| format!("Failed to kill process: {}", e))?;
+                
+                Ok::<(String, String, i32), String>((
+                    String::new(),
+                    format!("Script timed out after {} seconds", timeout.as_secs()),
+                    98
+                ))
+            }
+        }?;
+
+        Ok(output)
+    }
+
+    // 添加新的辅助方法来检查脚本环境
+    fn check_script_environment(&self, shell: &str) -> Result<(), String> {
+        match shell {
+            "python" => {
+                if !self.file_exists(&self.py_bin) {
+                    return Err("Python 未安装，请先运行 get_python()".to_string());
+                }
+            },
+            "powershell" => {
+                // Windows 系统通常预装 PowerShell，但仍可以检查
+                if !Path::new("powershell.exe").exists() && 
+                   !Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
+                    return Err("PowerShell 未找到".to_string());
+                }
+            },
+            "cmd" => {
+                // Windows 系统预装 CMD，但仍可以检查
+                if !Path::new("cmd.exe").exists() && 
+                   !Path::new("C:\\Windows\\System32\\cmd.exe").exists() {
+                    return Err("CMD 未找到".to_string());
+                }
+            },
+            "nushell" => {
+                if !self.file_exists(&self.nu_bin) {
+                    return Err("Nushell 未安装，请先运行 install_nu_shell()".to_string());
+                }
+            },
+            "deno" => {
+                if !self.file_exists(&self.deno_bin) {
+                    return Err("Deno 未安装，请先运行 install_deno()".to_string());
+                }
+            },
+            _ => return Err(format!("不支持的脚本类型: {}", shell)),
+        }
+        Ok(())
     }
 }
 
@@ -331,28 +532,32 @@ impl Agent {
 mod tests {
     use super::*;
 
-    fn create_test_agent() -> Agent {
-        Agent {
-            py_dir: "py3.11.9_amd64".to_string(),
-            py_bin: "py3.11.9_amd64/bin/python".to_string(),
-            py_base_dir: "C:\\Users\\29693\\Desktop\\test_dir".to_string(),
-            proxy: None,
-            program_dir: "C:\\Users\\29693\\Desktop\\test_nushell".to_string(),
-            nu_shell_bin: "C:\\Users\\29693\\Desktop\\test_nushell\\bin\\nu.exe".to_string(),
+    fn create_test_executor() -> ScriptExecutor {
+        ScriptExecutor {
+            py_bin: "C:\\Users\\29693\\Desktop\\test_dir\\py3.11.9_amd64\\python.exe".to_string(),
+            nu_bin: "C:\\Users\\29693\\Desktop\\test_nushell\\bin\\nu.exe".to_string(),
             deno_bin: "C:\\Users\\29693\\Desktop\\test_deno\\bin\\deno.exe".to_string(),
-            win_tmp_dir: String::from("./temp"),
+            program_dir: "C:\\Users\\29693\\Desktop\\test_nushell".to_string(),
+            win_tmp_dir: String::from(".\\temp"),
+            win_run_as_user_tmp_dir: String::from(".\\temp\\user"),
+            proxy: None,
         }
     }
 
     #[test]
     fn test_python_installation_and_script() {
-        let agent = create_test_agent();
+        let executor = create_test_executor();
         
         println!("=== 测试 Python 安装 ===");
-        agent.get_python(false);
+        
+        // 首先确保临时目录存在
+        fs::create_dir_all(&executor.win_tmp_dir)
+            .expect("无法创建临时目录");
+        
+        executor.get_python(false);
         
         // 创建并写入 Python 测试脚本
-        let python_script_path = Path::new(&agent.py_base_dir).join("test_script.py");
+        let python_script_path = Path::new(&executor.win_tmp_dir).join("test_script.py");
         println!("\n创建 Python 测试脚本: {}", python_script_path.display());
         
         let python_script_content = r#"
@@ -370,17 +575,20 @@ print("Python installation test successful!")
         if let Ok(content) = fs::read_to_string(&python_script_path) {
             println!("\nPython 脚本内容:\n{}", content);
         }
+
+        // 测试完成后清理临时文件
+        let _ = fs::remove_file(&python_script_path);
     }
 
     #[test]
     fn test_nushell_installation_and_script() {
-        let agent = create_test_agent();
+        let executor = create_test_executor();
         
         println!("=== 测试 Nu Shell 安装 ===");
-        match agent.install_nu_shell(false) {
+        match executor.install_nu_shell(false) {
             Ok(_) => {
                 // 创建脚本目录
-                let scripts_dir = Path::new(&agent.program_dir).join("scripts");
+                let scripts_dir = Path::new(&executor.win_tmp_dir).join("scripts");
                 fs::create_dir_all(&scripts_dir).expect("无法创建脚本目录");
                 
                 // 创建并写入 Nu Shell 测试脚本
@@ -409,14 +617,13 @@ echo "Nu Shell installation test successful!"
 
     #[test]
     fn test_deno_installation_and_script() {
-        let agent = create_test_agent();
+        let executor = create_test_executor();
         
         println!("=== 测试 Deno 安装 ===");
-        match agent.install_deno(false) {
+        match executor.install_deno(false) {
             Ok(_) => {
-                // 使用新的目标目录创建脚本目录
-                let deno_base_dir = "C:\\Users\\29693\\Desktop\\test_deno";
-                let scripts_dir = Path::new(deno_base_dir).join("scripts");
+                // 创建脚本目录
+                let scripts_dir = Path::new(&executor.win_tmp_dir).join("scripts");
                 fs::create_dir_all(&scripts_dir).expect("无法创建脚本目录");
                 
                 // 创建并写入 Deno 测试脚本
@@ -438,51 +645,200 @@ console.log("Deno installation test successful!");
                 if let Ok(content) = fs::read_to_string(&deno_script_path) {
                     println!("\nDeno 脚本内容:\n{}", content);
                 }
-                
-                // 打印最终的目录结构
-                println!("\n=== Deno 安装目录结构 ===");
-                println!("可执行文件: {}", agent.deno_bin);
-                println!("脚本文件: {}", deno_script_path.display());
             }
             Err(e) => panic!("Deno 安装失败: {}", e),
         }
     }
 
+    // 建议添加新的测试用例来测试 run_as_user 功能
     #[test]
-    fn test_create_temp_script_file() {
-        // 创建测试用的 Agent 实例
-        let agent = Agent {
-            win_tmp_dir: String::from("./temp"),  // 测试用临时目录
-            ..Default::default()
-        };
-
-        // 测试脚本内容
-        let test_code = "print('Hello, World!')";
+    fn test_run_script_as_user() {
+        let executor = create_test_executor();
         
-        // 测试 Python 脚本创建
-        let result = agent.create_temp_script_file(test_code, "python");
-        assert!(result.is_ok());
+        // 测试普通用户和提升权限用户的临时目录
+        let script_content = "print('Hello, World!')";
         
-        let path = result.unwrap();
-        assert!(path.exists());
-        assert!(path.extension().unwrap() == "py");
+        // 测试普通用户执行
+        let (stdout, _stderr, exit_code) = executor.run_script(
+            script_content,
+            "python",
+            vec![],
+            30,
+            false,  // run_as_user = false
+            vec![],
+            false,
+            "",
+        ).expect("脚本执行失败");
         
-        // 验证文件内容
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content, test_code);
+        assert_eq!(exit_code, 0, "普通用户脚本执行失败");
+        assert!(stdout.contains("Hello, World!"));
         
-        // 清理测试文件
-        fs::remove_file(path).unwrap();
+        // 测试提升权限用户执行
+        let (stdout, _stderr, exit_code) = executor.run_script(
+            script_content,
+            "python",
+            vec![],
+            30,
+            true,  // run_as_user = true
+            vec![],
+            false,
+            "",
+        ).expect("提升权限脚本执行失败");
+        
+        assert_eq!(exit_code, 0, "提升权限脚本执行失败");
+        assert!(stdout.contains("Hello, World!"));
     }
 
     #[test]
-    fn test_invalid_shell_type() {
-        let agent = Agent {
-            win_tmp_dir: String::from("./temp"),
-            ..Default::default()
-        };
+    fn test_run_script_with_different_shells() {
+        let executor = create_test_executor();
 
-        let result = agent.create_temp_script_file("test", "invalid_shell");
-        assert!(result.is_err());
+        // 1. 测试 Python 脚本执行
+        println!("=== 测试 Python 脚本执行 ===");
+        let python_test = executor.run_script(
+            "print('Hello from Python!')",
+            "python",
+            vec!["-u".to_string()],  // 无缓冲输出
+            30,
+            false,
+            vec!["PYTHON_TEST=true".to_string()],
+            false,
+            "",
+        );
+        match python_test {
+            Ok((stdout, stderr, exit_code)) => {
+                println!("Python 输出: {}", stdout);
+                println!("Python 错误: {}", stderr);
+                println!("退出码: {}", exit_code);
+                assert!(stdout.contains("Hello from Python!"));
+                assert_eq!(exit_code, 0);
+            },
+            Err(e) => panic!("Python 脚本执行失败: {}", e),
+        }
+
+        // 2. 测试 Deno 脚本执行
+        println!("\n=== 测试 Deno 脚本执行 ===");
+        let deno_test = executor.run_script(
+            "console.log('Hello from Deno!')",
+            "deno",
+            vec!["--allow-net".to_string()],
+            30,
+            false,
+            vec!["DENO_TEST=true".to_string()],
+            false,
+            "--allow-net --allow-read",
+        );
+        match deno_test {
+            Ok((stdout, stderr, exit_code)) => {
+                println!("Deno 输出: {}", stdout);
+                println!("Deno 错误: {}", stderr);
+                println!("退出码: {}", exit_code);
+                assert!(stdout.contains("Hello from Deno!"));
+                assert_eq!(exit_code, 0);
+            },
+            Err(e) => panic!("Deno 脚本执行失败: {}", e),
+        }
+
+        // 3. 测试 Nushell 脚本执行
+        println!("\n=== 测试 Nushell 脚本执行 ===");
+        let nu_test = executor.run_script(
+            "echo 'Hello from Nushell!'",
+            "nushell",
+            vec![],
+            30,
+            false,
+            vec!["NU_TEST=true".to_string()],
+            true,
+            "",
+        );
+        match nu_test {
+            Ok((stdout, stderr, exit_code)) => {
+                println!("Nushell 输出: {}", stdout);
+                println!("Nushell 错误: {}", stderr);
+                println!("退出码: {}", exit_code);
+                assert!(stdout.contains("Hello from Nushell!"));
+                assert_eq!(exit_code, 0);
+            },
+            Err(e) => panic!("Nushell 脚本执行失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_script_with_timeout() {
+        let executor = create_test_executor();
+        
+        println!("=== 测试脚本超时功能 ===");
+        let timeout_test = executor.run_script(
+            "import time\ntime.sleep(5)\nprint('This should not be printed')",
+            "python",
+            vec![],
+            2,  // 2秒超时
+            false,
+            vec![],
+            false,
+            "",
+        );
+
+        match timeout_test {
+            Ok((stdout, stderr, exit_code)) => {
+                println!("超时测试输出: {}", stdout);
+                println!("超时测试错误: {}", stderr);
+                println!("退出码: {}", exit_code);
+                assert!(stderr.contains("timed out"));
+                assert_eq!(exit_code, 98);  // 超时退出码
+            },
+            Err(e) => panic!("超时测试执行失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_script_with_env_vars() {
+        let executor = create_test_executor();
+        
+        println!("=== 测试环境变量传递 ===");
+        let env_test = executor.run_script(
+            "import os\nprint(f\"TEST_VAR = {os.getenv('TEST_VAR')}\")",
+            "python",
+            vec![],
+            30,
+            false,
+            vec!["TEST_VAR=hello_world".to_string()],
+            false,
+            "",
+        );
+
+        match env_test {
+            Ok((stdout, stderr, exit_code)) => {
+                println!("环境变量测试输出: {}", stdout);
+                println!("环境变量测试错误: {}", stderr);
+                println!("退出码: {}", exit_code);
+                assert!(stdout.contains("TEST_VAR = hello_world"));
+                assert_eq!(exit_code, 0);
+            },
+            Err(e) => panic!("环境变量测试执行失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_script_with_invalid_shell() {
+        let executor = create_test_executor();
+        
+        println!("=== 测试无效脚本类型 ===");
+        let invalid_shell_test = executor.run_script(
+            "echo 'test'",
+            "invalid_shell",
+            vec![],
+            30,
+            false,
+            vec![],
+            false,
+            "",
+        );
+
+        assert!(invalid_shell_test.is_err());
+        if let Err(e) = invalid_shell_test {
+            assert!(e.contains("不支持的脚本类型"));
+        }
     }
 }
+
