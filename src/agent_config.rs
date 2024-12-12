@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use winreg::RegKey;
 use winreg::enums::*;
-
+use std::env;
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     // 基本配置
@@ -81,20 +81,63 @@ pub fn get_install_dir_from_registry() -> Option<PathBuf> {
     }
 }
 
+// 方法1：使用环境变量获取系统盘
+fn get_system_drive_env() -> Option<PathBuf> {
+    env::var("SystemDrive")
+        .map(PathBuf::from)
+        .ok()
+}
+
+// 方法2：使用 Windows API 获取系统盘
+#[cfg(windows)]
+fn get_system_drive_winapi() -> Option<PathBuf> {
+    use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = [0u16; 260];
+    let len = unsafe {
+        GetWindowsDirectoryW(Some(&mut buffer))
+    };
+
+    if len > 0 {
+        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+        PathBuf::from(path)
+            .parent()
+            .map(|p| p.to_path_buf())
+    } else {
+        None
+    }
+}
+
+// 综合方法：获取系统盘
+fn get_system_drive() -> PathBuf {
+    // 尝试方法1：环境变量
+    get_system_drive_env()
+        // 如果方法1失败，尝试方法2：Windows API
+        .or_else(|| get_system_drive_winapi())
+        // 如果两种方法都失败，使用默认值
+        .unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
+fn get_program_dir() -> PathBuf {
+    // 优先从注册表获取安装目录
+    get_install_dir_from_registry()
+        // 如果注册表没有，则使用默认系统盘路径
+        .unwrap_or_else(|| {
+            let system_drive = get_system_drive();
+            system_drive.join("Program Files\\nextrmm-agent")
+        })
+}
+
 impl Default for ScriptConfig {
     fn default() -> Self {
-        // 获取基础安装目录
-        // 获取系统盘
-        let install_dir = get_install_dir_from_registry()
-            .unwrap_or_else(|| PathBuf::from("C:\\Program Files\\nextrmm-agent"));
-
+        let install_dir = get_program_dir();
         Self {
             program_dir: install_dir.to_string_lossy().to_string(),
-            py_bin: install_dir.join("runtime/python/python.exe/py3.11.9_amd64/python.exe").to_string_lossy().to_string(),
-            nu_bin: install_dir.join("runtime/nushell/nu.exe").to_string_lossy().to_string(),
-            deno_bin: install_dir.join("runtime/deno/deno.exe").to_string_lossy().to_string(),
+            py_bin: install_dir.join("runtime\\python\\python.exe").to_string_lossy().to_string(),
+            nu_bin: install_dir.join("runtime\\nushell\\nu.exe").to_string_lossy().to_string(),
+            deno_bin: install_dir.join("runtime\\deno\\deno.exe").to_string_lossy().to_string(),
             win_tmp_dir: install_dir.join("temp").to_string_lossy().to_string(),
-            win_run_as_user_tmp_dir: install_dir.join("temp/user").to_string_lossy().to_string(),
+            win_run_as_user_tmp_dir: install_dir.join("temp\\user").to_string_lossy().to_string(),
             proxy: None,
         }
     }

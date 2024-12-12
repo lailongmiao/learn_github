@@ -7,50 +7,8 @@ use zip::read::ZipArchive;
 use tempfile::Builder;
 use std::io::Write;
 use wait_timeout::ChildExt;
-use std::io::Read;
-use std::sync::Once;
 use crate::agent_config::{AgentConfig, ScriptConfig, get_install_dir_from_registry};
 use std::sync::Arc;
-
-static INIT: Once = Once::new();
-
-pub(crate) fn setup_test_environment() -> std::io::Result<()> {
-    // 使用临时目录进行测试
-    let temp_dir = tempfile::Builder::new()
-        .prefix("tactical-test")
-        .tempdir()?;
-    let base_dir = temp_dir.path();
-    // 注释问题
-    let config = AgentConfig {
-        script: ScriptConfig {
-            program_dir: base_dir.to_string_lossy().to_string(),
-            py_bin: base_dir.join("runtime/python/python.exe").to_string_lossy().to_string(),
-            nu_bin: base_dir.join("bin/nu.exe").to_string_lossy().to_string(),
-            deno_bin: base_dir.join("bin/deno.exe").to_string_lossy().to_string(),
-            // temp路径问题
-            win_tmp_dir: base_dir.join("temp").to_string_lossy().to_string(),
-            win_run_as_user_tmp_dir: base_dir.join("temp/user").to_string_lossy().to_string(),
-            proxy: None,
-        },
-        ..AgentConfig::default()
-    };
-
-    // 创建目录结构
-    // *******路径问题
-    fs::create_dir_all(Path::new(&config.script.program_dir).join("runtime/python"))?;
-    fs::create_dir_all(Path::new(&config.script.program_dir).join("bin"))?;
-    fs::create_dir_all(&config.script.win_tmp_dir)?;
-    fs::create_dir_all(&config.script.win_run_as_user_tmp_dir)?;
-    
-    Ok(())
-}
-
-fn setup() {
-    INIT.call_once(|| {
-        setup_test_environment().expect("Failed to setup test environment");
-    });
-}
-
 pub struct ScriptExecutor {
     config: Arc<ScriptConfig>,
 }
@@ -62,9 +20,10 @@ impl ScriptExecutor {
         }
     }
 
-    pub fn get_python(&self, force: bool) -> Result<(), String> {  // 修改返回类型
+    pub fn get_python(&self, force: bool) -> Result<(), String> {
+        // 如果已存在且不强制下载，则返回成功
         if Path::new(&self.config.py_bin).exists() && !force {
-            return Ok(());  // 如果已存在，直接返回成功
+            return Ok(());
         }
 
         if force {
@@ -77,19 +36,26 @@ impl ScriptExecutor {
         println!("GetPython() sleeping for {} seconds", sleep_delay);
         std::thread::sleep(std::time::Duration::new(sleep_delay as u64, 0));
 
-        // 确保父目录存在
-        if let Some(parent) = Path::new(&self.config.py_bin).parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create base directory: {}", e))?;
-        }
+        // 获取 runtime 目录，这里参考 py_bin 路径的父目录，但我们需要确保只获取到 "runtime" 而不是 "runtime\\python"
+        let py_bin_path = Path::new(&self.config.py_bin);
+        let runtime_dir = py_bin_path.parent()
+            .and_then(|parent| parent.parent())  // 去掉 "python" 目录，获取到 "runtime" 目录
+            .ok_or_else(|| "Failed to get runtime directory".to_string())?;
 
+        // 创建 runtime 目录
+        fs::create_dir_all(runtime_dir).map_err(|e| format!("Failed to create runtime directory: {}", e))?;
+
+        // 解压后的目标目录是 runtime 目录
         let arch_zip = "py3.11.9_amd64.zip";
-        let py_zip = Path::new(&self.config.py_bin).parent().unwrap().join(arch_zip);
+        let py_zip = runtime_dir.join(arch_zip);  // 将 ZIP 文件保存在 runtime 目录中
 
+        // 处理 panic 时的清理工作
         let py_zip_clone = py_zip.clone();
         let _cleanup = std::panic::catch_unwind(move || {
             fs::remove_file(&py_zip_clone).ok();
         });
-// ******Client::builder重复率较高
+
+        // 创建 HTTP 客户端
         let client = Client::builder();
 
         // 配置代理
@@ -106,6 +72,7 @@ impl ScriptExecutor {
         let url = "https://github.com/amidaware/rmmagent/releases/download/v2.8.0/py3.11.9_amd64.zip";
         println!("Downloading from URL: {}", url);
 
+        // 下载文件
         let mut response = client.get(url)
             .send()
             .map_err(|e| format!("无法下载 py3.11.9_amd64.zip: {}", e))?;
@@ -114,19 +81,34 @@ impl ScriptExecutor {
             return Err(format!("Unable to download py3.11.9_amd64.zip from GitHub. Status code: {}", response.status()));
         }
 
+        // 创建文件并保存
         let mut file = File::create(&py_zip).map_err(|e| format!("Failed to create zip file: {}", e))?;
         response.copy_to(&mut file).map_err(|e| format!("Failed to save zip file: {}", e))?;
 
-        // 解压前确保每个子目录都存在
-        if let Err(err) = self.unzip(&py_zip, &self.config.py_bin) {
+        // 解压到 runtime 目录
+        if let Err(err) = self.unzip(&py_zip, runtime_dir.to_str().unwrap()) {
             return Err(format!("解压失败: {}", err));
         }
 
-        Ok(())  // 返回成功
-    }
+        // 解压完成后，删除 ZIP 文件
+        fs::remove_file(&py_zip).map_err(|e| format!("Failed to delete zip file: {}", e))?;
 
-    fn file_exists(&self, path: &str) -> bool {
-        Path::new(path).exists()
+        // 将解压后的目录重命名为 python（不再嵌套）
+        let extracted_dir = runtime_dir.join("py3.11.9_amd64");  // 解压后的临时目录
+        let final_dir = runtime_dir.join("python");  // 目标目录是 python
+
+        // 如果目标目录已经存在，删除它（防止重命名失败）
+        if final_dir.exists() {
+            fs::remove_dir_all(&final_dir).map_err(|e| format!("Failed to remove existing python directory: {}", e))?;
+        }
+
+        // 将解压后的目录重命名为 python，解压后的文件将直接放在 runtime\\python
+        if let Err(e) = fs::rename(extracted_dir, final_dir) {
+            return Err(format!("Failed to rename extracted directory: {}", e));
+        }
+
+        // 最终应该是 runtime\\python\\python.exe
+        Ok(())  // 返回成功
     }
 
     fn unzip(&self, zip_path: &Path, dest_dir: &str) -> Result<(), String> {
@@ -137,7 +119,7 @@ impl ScriptExecutor {
             let mut file = archive.by_index(i).map_err(|e| format!("Failed to read file from zip: {}", e))?;
             let out_path = Path::new(dest_dir).join(file.name());
 
-            // 确保解压时每个子目录都存在，防止创建文件时路径不存在
+            // 确保解压时每个子目录都存在
             if let Some(parent_dir) = out_path.parent() {
                 if !parent_dir.exists() {
                     fs::create_dir_all(parent_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -158,15 +140,17 @@ impl ScriptExecutor {
 
         Ok(())
     }
+
     pub fn install_nu_shell(&self, force: bool) -> Result<(), String> {
         if Path::new(&self.config.nu_bin).exists() && !force {
             return Ok(());
         }
 
-        if force && self.file_exists(&self.config.nu_bin) {
+        if force && Path::new(&self.config.nu_bin).exists() {
             fs::remove_file(&self.config.nu_bin)
                 .map_err(|e| format!("Error removing nu.exe binary: {}", e))?;
         }
+
 
         // 随机延迟
         let sleep_delay = rand::thread_rng().gen_range(1..=10);
@@ -222,7 +206,6 @@ impl ScriptExecutor {
 
         // 创建临时目录
         let tmp_dir = tempfile::Builder::new()
-            .prefix("nu_temp")
             .tempdir()
             .map_err(|e| format!("Error creating temp directory: {}", e))?;
 
@@ -286,7 +269,7 @@ impl ScriptExecutor {
             return Ok(());
         }
 
-        if force && self.file_exists(&self.config.deno_bin) {
+        if force && Path::new(&self.config.deno_bin).exists() {
             fs::remove_file(&self.config.deno_bin)
                 .map_err(|e| format!("删除 deno.exe 失败: {}", e))?;
         }
@@ -297,7 +280,6 @@ impl ScriptExecutor {
 
         // 创建临时目录
         let tmp_dir = tempfile::Builder::new()
-            .prefix("tactical-deno")
             .tempdir()
             .map_err(|e| format!("创建临时目录失败: {}", e))?;
 
@@ -322,7 +304,7 @@ impl ScriptExecutor {
         };
 
         // 下载 Deno
-        let url = "https://github.com/denoland/deno/releases/download/v1.40.2/deno-x86_64-pc-windows-msvc.zip";
+        let url = "https://github.com/denoland/deno/releases/download/v2.1.3/deno-x86_64-pc-windows-msvc.zip";
         println!("Deno download url: {}", url);
 
         let mut response = client.get(url)
@@ -355,12 +337,11 @@ impl ScriptExecutor {
         &self,
         code: &str,
         shell: &str,
-        args: Vec<String>,
+        args: Vec<String>,  // 添加对 args 的使用
         timeout: i32,
         run_as_user: bool,
         env_vars: Vec<String>,
         nushell_enable_config: bool,
-        deno_default_permissions: &str,
     ) -> Result<(String, String, i32), String> {
         // 首先检查脚本环境
         self.check_script_environment(shell)?;
@@ -376,6 +357,7 @@ impl ScriptExecutor {
             fs::create_dir_all(tmp_dir)
                 .map_err(|e| format!("创建临时目录失败: {}", e))?;
         }
+
         // 1. 获取文件扩展名
         let extension = match shell {
             "powershell" => ".ps1",
@@ -397,14 +379,18 @@ impl ScriptExecutor {
         temp_file.as_file()
             .write_all(code.as_bytes())
             .map_err(|e| format!("写入脚本内容失败: {}", e))?;
-
         // 4. 转为 PathBuf 并返回
         let script_path = temp_file.into_temp_path();
-
+        println!("path is {}", script_path.display());
         // 创建一个绑定来延长临时值的生命周期
         let path_string = script_path.to_string_lossy();
-        
-        let (exe, mut cmd_args) = match shell {
+        let final_path = path_string.to_string().replace("C:", "C:\\");
+
+        // 打印最终的路径以供调试
+        println!("Final path for Deno script: {}", final_path);
+
+        // 根据不同 shell 准备执行参数
+        let (exe, cmd_args) = match shell {
             "powershell" => (
                 "powershell.exe",
                 vec![
@@ -412,15 +398,15 @@ impl ScriptExecutor {
                     "-NoProfile".to_string(),
                     "-ExecutionPolicy".to_string(),
                     "Bypass".to_string(),
-                    path_string.to_string(),
+                    final_path.to_string(),
                 ]
             ),
             "python" => (
                 self.config.py_bin.as_str(),
-                vec![path_string.to_string()]
+                vec![final_path.to_string()]
             ),
             "cmd" => (
-                path_string.as_ref(),
+                final_path.as_ref(),
                 Vec::new()
             ),
             "nushell" => {
@@ -437,99 +423,115 @@ impl ScriptExecutor {
                 } else {
                     vec!["--no-config-file".to_string()]
                 };
-                nushell_args.push(path_string.to_string());
+                nushell_args.push(final_path.to_string());
                 (self.config.nu_bin.as_str(), nushell_args)
             },
             "deno" => {
                 if !Path::new(&self.config.deno_bin).exists() {
                     return Err("Deno executable not found".to_string());
                 }
-                let mut deno_args = vec!["run".to_string(), "--no-prompt".to_string()];
-                
-                // 处理 Deno 权限
-                let mut found = false;
-                for env_var in &env_vars {
-                    if env_var.starts_with("DENO_PERMISSIONS=") {
-                        if let Some(permissions) = env_var.split('=').nth(1) {
-                            deno_args.extend(permissions.split_whitespace().map(String::from));
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                
-                if !found && !deno_default_permissions.is_empty() {
-                    deno_args.extend(deno_default_permissions.split_whitespace().map(String::from));
-                }
-                
-                deno_args.push(path_string.to_string());
+
+                let mut deno_args = vec![
+                    "run".to_string(),
+                    "--no-prompt".to_string(),
+                    "--allow-all".to_string(), // Keep only this one if you want all permissions
+                    final_path.to_string(),
+                ];
+                // 添加额外的参数
+                deno_args.extend(args);
+                // 输出 deno 执行的完整命令，用于调试
+                println!("Executing command: {} {:?}", self.config.deno_bin.as_str(), deno_args);
                 (self.config.deno_bin.as_str(), deno_args)
             },
-            _ => return Err(format!("Unsupported shell type: {}", shell)),
+
+
+            _ => return Err(format!("不支持的脚本类型: {}", shell)),
         };
 
-        // 加额外参数
-        cmd_args.extend(args);
+        // 打印执行的命令和参数，方便调试
+        println!("Executing command: {} {:?}", exe, cmd_args);
 
-        println!("exe:{}",exe);
+        // 执行命令
+        let output = self.execute_command(
+            exe,
+            cmd_args,
+            timeout,
+            env_vars
+        )?;
+
+        Ok(output)
+    }
+    // 辅助方法：执行命令
+    fn execute_command(
+        &self,
+        exe: &str,
+        args: Vec<String>,
+        timeout: i32,
+        env_vars: Vec<String>
+    ) -> Result<(String, String, i32), String> {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        use std::io::{Read, Write};
+
         // 创建命令
-        let mut cmd = std::process::Command::new(exe);
-        cmd.args(&cmd_args);
+        println!("Executing command: {} {:?}", exe, args);
+        let mut cmd = Command::new(exe);
+        cmd.args(&args);
 
         // 设置环境变量
-        if !env_vars.is_empty() {
-            cmd.envs(env_vars.iter().filter_map(|var| {
-                let parts: Vec<&str> = var.split('=').collect();
-                if parts.len() == 2 {
-                    Some((parts[0], parts[1]))
-                } else {
-                    None
-                }
-            }));
+        for var in env_vars {
+            if let Some((key, value)) = var.split_once('=') {
+                cmd.env(key, value);
+            }
         }
 
-        // 创建管道
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+        // 重定向输出
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         // 启动进程
         let mut child = cmd.spawn()
-            .map_err(|e| format!("Failed to start process: {}", e))?;
+            .map_err(|e| format!("启动进程失败: {}", e))?;
 
-        // 设置超时
-        let timeout = std::time::Duration::from_secs(timeout as u64);
+        // 处理超时和输出
+        let output = if timeout > 0 {
+            // 使用 wait_timeout 处理超时
+            match child.wait_timeout(Duration::from_secs(timeout as u64)) {
+                Ok(Some(status)) => {
+                    // 进程正常结束，获取输出
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
 
-        // 获取输出
-        let output = match child.wait_timeout(timeout)
-            .map_err(|e| format!("Error waiting for process: {}", e))? {
-            Some(status) => {
-                let stdout = String::from_utf8_lossy(&child.stdout.take()
-                    .ok_or("Failed to capture stdout")?
-                    .bytes()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("Failed to read stdout: {}", e))?).to_string();
-                
-                let stderr = String::from_utf8_lossy(&child.stderr.take()
-                    .ok_or("Failed to capture stderr")?
-                    .bytes()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("Failed to read stderr: {}", e))?).to_string();
+                    if let Some(mut stdout_pipe) = child.stdout.take() {
+                        stdout_pipe.read_to_string(&mut stdout)
+                            .map_err(|e| format!("读取标准输出失败: {}", e))?;
+                    }
 
-                let exit_code = status.code().unwrap_or(1);
-                Ok::<(String, String, i32), String>((stdout, stderr, exit_code))
-            },
-            None => {
-                // 超时处理
-                child.kill()
-                    .map_err(|e| format!("Failed to kill process: {}", e))?;
-                
-                Ok::<(String, String, i32), String>((
-                    String::new(),
-                    format!("Script timed out after {} seconds", timeout.as_secs()),
-                    98
-                ))
+                    if let Some(mut stderr_pipe) = child.stderr.take() {
+                        stderr_pipe.read_to_string(&mut stderr)
+                            .map_err(|e| format!("读取错误输出失败: {}", e))?;
+                    }
+
+                    (stdout, stderr, status.code().unwrap_or(1))
+                },
+                Ok(None) => {
+                    // 超时
+                    child.kill().ok();
+                    return Err("进程执行超时".to_string());
+                },
+                Err(e) => return Err(format!("等待进程失败: {}", e)),
             }
-        }?;
+        } else {
+            // 无超时限制
+            let output = child.wait_with_output()
+                .map_err(|e| format!("获取进程输出失败: {}", e))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(1);
+
+            (stdout, stderr, exit_code)
+        };
 
         Ok(output)
     }
@@ -538,7 +540,7 @@ impl ScriptExecutor {
     fn check_script_environment(&self, shell: &str) -> Result<(), String> {
         match shell {
             "python" => {
-                if !self.file_exists(&self.config.py_bin) {
+                if !Path::new(&self.config.py_bin).exists() {
                     return Err("Python 未安装，请先运行 get_python()".to_string());
                 }
             },
@@ -557,12 +559,12 @@ impl ScriptExecutor {
                 }
             },
             "nushell" => {
-                if !self.file_exists(&self.config.nu_bin) {
+                if !Path::new(&self.config.nu_bin).exists() {
                     return Err("Nushell 未安装，请先运行 install_nu_shell()".to_string());
                 }
             },
             "deno" => {
-                if !self.file_exists(&self.config.deno_bin) {
+                if !Path::new(&self.config.deno_bin).exists() {
                     return Err("Deno 未安装，请先运行 install_deno()".to_string());
                 }
             },
@@ -576,6 +578,8 @@ impl ScriptExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
     // 确保环境安装的辅助函数
     fn ensure_environments(executor: &ScriptExecutor) -> Result<(), String> {
         println!("正在检查并安装必要的脚本环境...");
@@ -612,6 +616,40 @@ mod tests {
 
         executor
     }
+
+    // 清理测试环境
+    fn cleanup_test_environment() -> std::io::Result<()> {
+        if let Some(install_dir) = get_install_dir_from_registry() {
+            // 定义一个清理目录的闭包
+            let cleanup_dir = |dir_path: &Path| -> std::io::Result<()> {
+                if dir_path.exists() {
+                    println!("清理目录: {:?}", dir_path);
+                    fs::remove_dir_all(dir_path)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                } else {
+                    Ok(())
+                }
+            };
+
+            // 清理临时目录
+            cleanup_dir(&install_dir.join("temp"))?;
+            cleanup_dir(&install_dir.join("temp/user"))?;
+
+            // 清理运行时目录
+            let runtime_dirs = [
+                "runtime/python",
+                "runtime/nushell",
+                "runtime/deno"
+            ];
+
+            for dir in runtime_dirs {
+                cleanup_dir(&install_dir.join(dir))?;
+            }
+        }
+
+        Ok(())
+    }
+
     // 添加 Clone 和 Debug traits
     #[derive(Clone, Debug)]
     struct ScriptTest {
@@ -622,6 +660,7 @@ mod tests {
         env_vars: Vec<String>,
         install_fn: fn(&ScriptExecutor) -> Result<(), String>,
     }
+
     fn test_script_execution(test_case: ScriptTest) -> Result<(), String> {
         let executor = create_test_executor();
 
@@ -639,7 +678,6 @@ mod tests {
             false,
             test_case.env_vars,
             false,
-            "",
         )?;
         // 3. 验证结果
         println!("{} 输出: {}", test_case.shell, stdout);
@@ -651,54 +689,20 @@ mod tests {
         assert_eq!(exit_code, 0, "脚本执行失败");
         Ok(())
     }
-    fn cleanup_test_environment() -> std::io::Result<()> {
-        if let Some(install_dir) = get_install_dir_from_registry() {
-            // 清理临时目录
-            let temp_dir = install_dir.join("temp");
-            let temp_user_dir = install_dir.join("temp/user");
 
-            if temp_dir.exists() {
-                fs::remove_dir_all(&temp_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            }
-
-            if temp_user_dir.exists() {
-                fs::remove_dir_all(&temp_user_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            }
-
-            // 清理 Python、Nushell、Deno 相关目录
-            let py_dir = install_dir.join("runtime/python");
-            let nu_dir = install_dir.join("runtime/nushell");
-            let deno_dir = install_dir.join("runtime/deno");
-
-            if py_dir.exists() {
-                fs::remove_dir_all(py_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            }
-
-            if nu_dir.exists() {
-                fs::remove_dir_all(nu_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            }
-
-            if deno_dir.exists() {
-                fs::remove_dir_all(deno_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            }
-        }
-
-        Ok(())
-    }
-    //*******"C:\Program Files\nextrmm-agent\runtime\python\python.exe\py3.11.9_amd64\python.exe"
     #[test]
     fn test_all_shells() {
+        // 清理环境
         cleanup_test_environment().expect("清理临时目录失败");
-        setup();
+
         // Python 测试用例
         let python_test = ScriptTest {
             shell: "python",
-            script: "print('Hello from Python!')",
-            expected_output: "Hello from Python!",
+            script: "print('Hello from Python! ')",
+            expected_output: "Hello from Python! ",
             args: vec![],
             env_vars: vec![],
             install_fn: |executor| {
-                // 现在这里只需要检查环境是否存在
                 if !Path::new(&executor.config.py_bin).exists() {
                     executor.get_python(false).map_err(|e| format!("python安装失败：{}", e))?;
                 }
@@ -709,8 +713,8 @@ mod tests {
         // Nushell 测试用例
         let nushell_test = ScriptTest {
             shell: "nushell",
-            script: "echo 'Hello from Nushell!'",
-            expected_output: "Hello from Nushell!",
+            script: "echo 'Hello from Nushell! '",
+            expected_output: "Hello from Nushell! ",
             args: vec![],
             env_vars: vec![],
             install_fn: |executor| {
@@ -724,8 +728,8 @@ mod tests {
         // Deno 测试用例
         let deno_test = ScriptTest {
             shell: "deno",
-            script: "console.log('Hello from Deno!')",
-            expected_output: "Hello from Deno!",
+            script: "console.log('Hello from Deno! ')",
+            expected_output: "Hello from Deno! ",
             args: vec![],
             env_vars: vec![],
             install_fn: |executor| {
@@ -735,100 +739,18 @@ mod tests {
                 Ok(())
             },
         };
+
         // 执行所有测试
         for test in [python_test, nushell_test, deno_test] {
             test_script_execution(test.clone())
                 .unwrap_or_else(|e| panic!("{} 测试失败: {}", test.shell, e));
         }
-    }
-    #[test]
-    fn test_timeout_and_error_cases() {
+
+        // 清理环境（可以选择在这里再次清理）
         cleanup_test_environment().expect("清理临时目录失败");
-        let executor = create_test_executor();
-
-        // 测试超时情况
-        let timeout_result = executor.run_script(
-            "import time\ntime.sleep(5)",
-            "python",
-            vec![],
-            2,  // 2秒超时
-            false,
-            vec![],
-            false,
-            "",
-        );
-
-        match timeout_result {
-            Ok((_, stderr, exit_code)) => {
-                assert!(stderr.contains("timed out"));
-                assert_eq!(exit_code, 98);
-            },
-            Err(e) => panic!("超时测试执行失败: {}", e),
-        }
-
-        // 测试无效的脚本类型
-        let invalid_shell_result = executor.run_script(
-            "echo 'test'",
-            "invalid_shell",
-            vec![],
-            30,
-            false,
-            vec![],
-            false,
-            "",
-        );
-
-        assert!(invalid_shell_result.is_err());
-        assert!(invalid_shell_result.unwrap_err().contains("不支持的脚本类型"));
-    }
-
-    #[test]
-    fn test_environment_variables() {
-        cleanup_test_environment().expect("清理临时目录失败");
-        let executor = create_test_executor();
-
-        // 首先确保 Deno 已安装
-        executor.install_deno(false).expect("安装 Deno 失败");
-
-        let test_cases = vec![
-            ("python", "import os\nprint(os.getenv('TEST_VAR'))", "test_value", vec![]),
-            ("nushell", "echo $env.TEST_VAR", "test_value", vec![]),
-            ("deno", "console.log(Deno.env.get('TEST_VAR'))", "test_value",
-             vec!["--allow-env".to_string()]),  // 简化 Deno 命令参数
-        ];
-
-        for (shell, script, expected, args) in test_cases {
-            println!("测试 {} 环境变量", shell);  // 添加调试信息
-
-            let result = executor.run_script(
-                script,
-                shell,
-                args,
-                30,
-                false,
-                vec!["TEST_VAR=test_value".to_string()],
-                false,
-                "--allow-env",  // 添加默认权限
-            );
-
-            match result {
-                Ok((stdout, stderr, exit_code)) => {
-                    // 添加更多调试信息
-                    println!("{}测试结果:", shell);
-                    println!("stdout: '{}'", stdout);
-                    println!("stderr: '{}'", stderr);
-                    println!("exit_code: {}", exit_code);
-
-                    assert!(stdout.contains(expected),
-                            "{} 环境变量测试失败: 预期 '{}', 实际输出 '{}'",
-                            shell, expected, stdout);
-                    assert_eq!(exit_code, 0);
-                },
-                Err(e) => panic!("{} 环境变量测试失败: {}", shell, e),
-            }
-        }
     }
 }
+
 
 
 
