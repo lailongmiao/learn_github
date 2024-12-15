@@ -519,7 +519,7 @@ impl ScriptExecutor {
                     child.kill().ok();
                     return Err("进程执行超时".to_string());
                 },
-                Err(e) => return Err(format!("等待进程失败: {}", e)),
+                Err(e) => return Err(format!("等待程失败: {}", e)),
             }
         } else {
             // 无超时限制
@@ -690,55 +690,60 @@ mod tests {
         Ok(())
     }
 
+    fn create_test_case(shell: &'static str, script: &'static str, expected_output: &'static str, install_fn: fn(&ScriptExecutor) -> Result<(), String>) -> ScriptTest {
+        ScriptTest {
+            shell,
+            script,
+            expected_output,
+            args: vec![],
+            env_vars: vec![],
+            install_fn,
+        }
+    }
+
     #[test]
     fn test_all_shells() {
         // 清理环境
         cleanup_test_environment().expect("清理临时目录失败");
 
         // Python 测试用例
-        let python_test = ScriptTest {
-            shell: "python",
-            script: "print('Hello from Python! ')",
-            expected_output: "Hello from Python! ",
-            args: vec![],
-            env_vars: vec![],
-            install_fn: |executor| {
+        let python_test = create_test_case(
+            "python",
+            "print('Hello from Python! ')",
+            "Hello from Python! ",
+            |executor| {
                 if !Path::new(&executor.config.py_bin).exists() {
                     executor.get_python(false).map_err(|e| format!("python安装失败：{}", e))?;
                 }
                 Ok(())
             },
-        };
+        );
 
         // Nushell 测试用例
-        let nushell_test = ScriptTest {
-            shell: "nushell",
-            script: "echo 'Hello from Nushell! '",
-            expected_output: "Hello from Nushell! ",
-            args: vec![],
-            env_vars: vec![],
-            install_fn: |executor| {
+        let nushell_test = create_test_case(
+            "nushell",
+            "echo 'Hello from Nushell! '",
+            "Hello from Nushell! ",
+            |executor| {
                 if !Path::new(&executor.config.nu_bin).exists() {
                     executor.install_nu_shell(false).map_err(|e| format!("Nushell安装失败：{}", e))?;
                 }
                 Ok(())
             },
-        };
+        );
 
         // Deno 测试用例
-        let deno_test = ScriptTest {
-            shell: "deno",
-            script: "console.log('Hello from Deno! ')",
-            expected_output: "Hello from Deno! ",
-            args: vec![],
-            env_vars: vec![],
-            install_fn: |executor| {
+        let deno_test = create_test_case(
+            "deno",
+            "console.log('Hello from Deno! ')",
+            "Hello from Deno! ",
+            |executor| {
                 if !Path::new(&executor.config.deno_bin).exists() {
                     executor.install_deno(false).map_err(|e| format!("Deno安装失败：{}", e))?;
                 }
                 Ok(())
             },
-        };
+        );
 
         // 执行所有测试
         for test in [python_test, nushell_test, deno_test] {
