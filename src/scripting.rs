@@ -25,7 +25,6 @@ impl ScriptExecutor {
         if Path::new(&self.config.py_bin).exists() && !force {
             return Ok(());
         }
-
         if force {
             if let Some(parent) = Path::new(&self.config.py_bin).parent() {
                 fs::remove_dir_all(parent).map_err(|e| format!("Failed to remove directory: {}", e))?;
@@ -56,42 +55,23 @@ impl ScriptExecutor {
         });
 
         // 创建 HTTP 客户端
-        let client = Client::builder();
-
-        // 配置代理
+        let client_builder = Client::builder();
         let client = if let Some(proxy_url) = &self.config.proxy {
-            println!("使用代理: {}", proxy_url);
-            client.proxy(reqwest::Proxy::all(proxy_url)
-                .map_err(|e| format!("代理设置无效: {}", e))?)
+            client_builder
+                .proxy(reqwest::Proxy::all(proxy_url)
+                    .map_err(|e| format!("代理配置失败: {}", e))?)
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?
         } else {
-            client
+            client_builder
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?
         };
-
-        let client = client.build().map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
 
         let url = "https://github.com/amidaware/rmmagent/releases/download/v2.8.0/py3.11.9_amd64.zip";
         println!("Downloading from URL: {}", url);
 
-        // 下载文件
-        let mut response = client.get(url)
-            .send()
-            .map_err(|e| format!("无法下载 py3.11.9_amd64.zip: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Unable to download py3.11.9_amd64.zip from GitHub. Status code: {}", response.status()));
-        }
-
-        // 创建文件并保存
-        let mut file = File::create(&py_zip).map_err(|e| format!("Failed to create zip file: {}", e))?;
-        response.copy_to(&mut file).map_err(|e| format!("Failed to save zip file: {}", e))?;
-
-        // 解压到 runtime 目录
-        if let Err(err) = self.unzip(&py_zip, runtime_dir.to_str().unwrap()) {
-            return Err(format!("解压失败: {}", err));
-        }
-
-        // 解压完成后，删除 ZIP 文件
-        fs::remove_file(&py_zip).map_err(|e| format!("Failed to delete zip file: {}", e))?;
+        self.download_and_extract(&client, url, runtime_dir, "py3.11.9_amd64.zip", false)?;
 
         // 将解压后的目录重命名为 python（不再嵌套）
         let extracted_dir = runtime_dir.join("py3.11.9_amd64");  // 解压后的临时目录
@@ -110,37 +90,6 @@ impl ScriptExecutor {
         // 最终应该是 runtime\\python\\python.exe
         Ok(())  // 返回成功
     }
-
-    fn unzip(&self, zip_path: &Path, dest_dir: &str) -> Result<(), String> {
-        let file = File::open(zip_path).map_err(|e| format!("Failed to open zip file: {}", e))?;
-        let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
-
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| format!("Failed to read file from zip: {}", e))?;
-            let out_path = Path::new(dest_dir).join(file.name());
-
-            // 确保解压时每个子目录都存在
-            if let Some(parent_dir) = out_path.parent() {
-                if !parent_dir.exists() {
-                    fs::create_dir_all(parent_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
-                }
-            }
-
-            if file.name().ends_with('/') {
-                // 是目录项，创建目录
-                fs::create_dir_all(&out_path).map_err(|e| format!("Failed to create dir: {}", e))?;
-            } else {
-                // 是文件项，写入文件
-                let mut output_file = File::create(&out_path)
-                    .map_err(|e| format!("Failed to create file: {}", e))?;
-                std::io::copy(&mut file, &mut output_file)
-                    .map_err(|e| format!("Failed to extract file: {}", e))?;
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn install_nu_shell(&self, force: bool) -> Result<(), String> {
         if Path::new(&self.config.nu_bin).exists() && !force {
             return Ok(());
@@ -209,33 +158,22 @@ impl ScriptExecutor {
             .tempdir()
             .map_err(|e| format!("Error creating temp directory: {}", e))?;
 
-        // 下载文件
-        let client = Client::builder();
+        // 创建 HTTP 客户端
+        let client_builder = Client::builder();
         let client = if let Some(proxy_url) = &self.config.proxy {
-            client.proxy(reqwest::Proxy::all(proxy_url)
-                .map_err(|e| format!("Invalid proxy settings: {}", e))?)
+            client_builder
+                .proxy(reqwest::Proxy::all(proxy_url)
+                    .map_err(|e| format!("代理配置失败: {}", e))?)
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?
         } else {
-            client
+            client_builder
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?
         };
-        let client = client.build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        let tmp_asset_path = tmp_dir.path().join(&asset_name);
-        let mut response = client.get(&url)
-            .send()
-            .map_err(|e| format!("Failed to download nu shell: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Download failed with status: {}", response.status()));
-        }
-
-        let mut file = File::create(&tmp_asset_path)
-            .map_err(|e| format!("Failed to create temp file: {}", e))?;
-        response.copy_to(&mut file)
-            .map_err(|e| format!("Failed to save downloaded file: {}", e))?;
-
-        // 解压并安装
-        self.unzip(&tmp_asset_path, tmp_dir.path().to_str().unwrap())?;
+        // 下载文件
+        self.download_and_extract(&client, &url, &program_bin_dir, &asset_name, true)?;
 
         // 检查解压后的文件是否存在
         let nu_exe_path = tmp_dir.path().join("nu.exe");
@@ -284,7 +222,7 @@ impl ScriptExecutor {
             .map_err(|e| format!("创建临时目录失败: {}", e))?;
 
         let asset_name = "deno-x86_64-pc-windows-msvc.zip";
-        let tmp_asset_path = tmp_dir.path().join(asset_name);
+        let _tmp_asset_path = tmp_dir.path().join(asset_name);
 
         // 修改客户端配置，添加超时设置
         let client = Client::builder()
@@ -307,16 +245,7 @@ impl ScriptExecutor {
         let url = "https://github.com/denoland/deno/releases/download/v2.1.3/deno-x86_64-pc-windows-msvc.zip";
         println!("Deno download url: {}", url);
 
-        let mut response = client.get(url)
-            .send()
-            .map_err(|e| format!("下载失败: {}", e))?;
-        let mut file = File::create(&tmp_asset_path)
-            .map_err(|e| format!("创建临时文件失败: {}", e))?;
-        response.copy_to(&mut file)
-            .map_err(|e| format!("保存下载文件失败: {}", e))?;
-
-        // 解压并安装
-        self.unzip(&tmp_asset_path, tmp_dir.path().to_str().unwrap())?;
+        self.download_and_extract(&client, url, tmp_dir.path(), "deno-x86_64-pc-windows-msvc.zip", true)?;
 
         // 确保目标目录存在
         if let Some(parent) = Path::new(&self.config.deno_bin).parent() {
@@ -329,6 +258,36 @@ impl ScriptExecutor {
             tmp_dir.path().join("deno.exe"),
             &self.config.deno_bin
         ).map_err(|e| format!("复制 deno.exe 失败: {}", e))?;
+
+        Ok(())
+    }
+    // 辅助方法：解压
+    fn unzip(&self, zip_path: &Path, dest_dir: &str) -> Result<(), String> {
+        let file = File::open(zip_path).map_err(|e| format!("Failed to open zip file: {}", e))?;
+        let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|e| format!("Failed to read file from zip: {}", e))?;
+            let out_path = Path::new(dest_dir).join(file.name());
+
+            // 确保解压时每个子目录都存在
+            if let Some(parent_dir) = out_path.parent() {
+                if !parent_dir.exists() {
+                    fs::create_dir_all(parent_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+                }
+            }
+
+            if file.name().ends_with('/') {
+                // 是目录项，创建目录
+                fs::create_dir_all(&out_path).map_err(|e| format!("Failed to create dir: {}", e))?;
+            } else {
+                // 是文件项，写入文件
+                let mut output_file = File::create(&out_path)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut output_file)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            }
+        }
 
         Ok(())
     }
@@ -389,7 +348,7 @@ impl ScriptExecutor {
         // 打印最终的路径以供调试
         println!("Final path for Deno script: {}", final_path);
 
-        // 根据不同 shell 准备执行参数
+        // 根据不同 shell 准备��行参数
         let (exe, cmd_args) = match shell {
             "powershell" => (
                 "powershell.exe",
@@ -461,7 +420,7 @@ impl ScriptExecutor {
 
         Ok(output)
     }
-    // 辅助方法：执行命令
+    // ���助方法：执行命令
     fn execute_command(
         &self,
         exe: &str,
@@ -471,7 +430,7 @@ impl ScriptExecutor {
     ) -> Result<(String, String, i32), String> {
         use std::process::{Command, Stdio};
         use std::time::Duration;
-        use std::io::{Read, Write};
+        use std::io::Read;
 
         // 创建命令
         println!("Executing command: {} {:?}", exe, args);
@@ -535,7 +494,41 @@ impl ScriptExecutor {
 
         Ok(output)
     }
+    // 辅助方法：下载并解压
+    fn download_and_extract(
+        &self,
+        client: &reqwest::blocking::Client,
+        url: &str,
+        dest_dir: &Path,
+        asset_name: &str,
+        use_temp_dir: bool,
+    ) -> Result<(), String> {
+        let tmp_asset_path = if use_temp_dir {
+            let tmp_dir = tempfile::Builder::new()
+                .tempdir()
+                .map_err(|e| format!("创建临时目录失败: {}", e))?;
+            tmp_dir.path().join(asset_name)
+        } else {
+            dest_dir.join(asset_name)
+        };
 
+        let mut response = client.get(url)
+            .send()
+            .map_err(|e| format!("下载失败: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("下载失败，状态码: {}", response.status()));
+        }
+
+        let mut file = File::create(&tmp_asset_path)
+            .map_err(|e| format!("创建文件失败: {}", e))?;
+        response.copy_to(&mut file)
+            .map_err(|e| format!("保存下载文件失败: {}", e))?;
+
+        self.unzip(&tmp_asset_path, dest_dir.to_str().unwrap())?;
+        Ok(())
+    }
+    
     // 添加新的辅助方法来检查脚本环境
     fn check_script_environment(&self, shell: &str) -> Result<(), String> {
         match shell {
@@ -679,7 +672,7 @@ mod tests {
             test_case.env_vars,
             false,
         )?;
-        // 3. 验证结果
+        // 3. 验证结果 
         println!("{} 输出: {}", test_case.shell, stdout);
         println!("{} 错误: {}", test_case.shell, stderr);
         println!("退出码: {}", exit_code);
@@ -755,6 +748,7 @@ mod tests {
         cleanup_test_environment().expect("清理临时目录失败");
     }
 }
+
 
 
 
