@@ -67,7 +67,7 @@ impl Default for AgentConfig {
     }
 }
 
-// 从注册表获取安装目录
+//Get installation directory from registry
 pub fn get_install_dir_from_registry() -> Option<PathBuf> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     match hklm.open_subkey("SOFTWARE\\TacticalRMM") {
@@ -81,14 +81,14 @@ pub fn get_install_dir_from_registry() -> Option<PathBuf> {
     }
 }
 
-// 方法1：使用环境变量获取系统盘
+// Method 1: Get system drive using environment variable
 fn get_system_drive_env() -> Option<PathBuf> {
     env::var("SystemDrive")
         .map(PathBuf::from)
         .ok()
 }
 
-// 方法2：使用 Windows API 获取系统盘
+// Method 2: Get system drive using Windows API
 #[cfg(windows)]
 fn get_system_drive_winapi() -> Option<PathBuf> {
     use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
@@ -108,20 +108,20 @@ fn get_system_drive_winapi() -> Option<PathBuf> {
     }
 }
 
-// 综合方法：获取系统盘
+// Comprehensive method: Get system drive
 fn get_system_drive() -> PathBuf {
-    // 尝试方法1：环境变量
+    // Try method 1: Environment variable
     get_system_drive_env()
-        // 如果方法1失败，尝试方法2：Windows API
+        // If method 1 fails, try method 2: Windows API
         .or_else(|| get_system_drive_winapi())
-        // 如果两种方法都失败，使用默认值
+        // If both methods fail, use default value
         .unwrap_or_else(|| PathBuf::from("C:\\"))
 }
 
 fn get_program_dir() -> PathBuf {
-    // 优先从注册表获取安装目录
+    // Prioritize getting installation directory from registry
     get_install_dir_from_registry()
-        // 如果注册表没有，则使用默认系统盘路径
+        // If registry is not found, use default system drive path
         .unwrap_or_else(|| {
             let system_drive = get_system_drive();
             system_drive.join("Program Files\\nextrmm-agent")
@@ -144,7 +144,7 @@ impl Default for ScriptConfig {
 }
 
 impl AgentConfig {
-    // 从文件加载配置
+    //  Load configuration from file
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         let lines: Vec<&str> = content.lines().collect();
@@ -182,7 +182,7 @@ impl AgentConfig {
         Ok(config)
     }
 
-    // 保存配置到文件
+    // Save configuration to file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut content = String::new();
 
@@ -219,13 +219,13 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
 
-        // 保存配置
+        // Save configuration
         config.save(path).unwrap();
 
-        // 加载配置
+        // Load configuration
         let loaded_config = AgentConfig::load(path).unwrap();
 
-        // 验证配置
+        // Verify configuration
         assert_eq!(config.agent_id, loaded_config.agent_id);
         assert_eq!(config.agent_version, loaded_config.agent_version);
         assert_eq!(config.mqtt.broker_host, loaded_config.mqtt.broker_host);
