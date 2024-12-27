@@ -41,43 +41,55 @@ impl ScriptExecutor {
             .and_then(|parent| parent.parent())  // Remove "python" directory, get "runtime" directory
             .ok_or_else(|| "Failed to get runtime directory".to_string())?;
 
+        // Before downloading and extracting, ensure the target directory is clean
+        let python_dir = runtime_dir.join("python");
+        let extracted_dir = runtime_dir.join("py3.11.9_amd64");
+
+        // If force install, clean existing directories first
+        if force {
+            println!("Force install: cleaning existing directories");
+            if python_dir.exists() {
+                fs::remove_dir_all(&python_dir)
+                    .map_err(|e| format!("Failed to remove existing python directory: {}", e))?;
+            }
+            if extracted_dir.exists() {
+                fs::remove_dir_all(&extracted_dir)
+                    .map_err(|e| format!("Failed to remove existing extracted directory: {}", e))?;
+            }
+        }
+
         // Create runtime directory
-        fs::create_dir_all(runtime_dir).map_err(|e| format!("Failed to create runtime directory: {}", e))?;
+        println!("Creating runtime directory: {}", runtime_dir.display());
+        fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("Failed to create runtime directory: {}", e))?;
 
-        // The target directory after decompression is the runtime directory
-        let arch_zip = "py3.11.9_amd64.zip";
-        let py_zip = runtime_dir.join(arch_zip);  // Save ZIP file in runtime directory
-
-        // Handle cleanup work when panic occurs
-        let py_zip_clone = py_zip.clone();
-        let _cleanup = std::panic::catch_unwind(move || {
-            fs::remove_file(&py_zip_clone).ok();
-        });
-
-        // Create HTTP client
+        // Download and extract
         let client = self.create_http_client()?;
-
         let url = "https://github.com/amidaware/rmmagent/releases/download/v2.8.0/py3.11.9_amd64.zip";
-        println!("Downloading from URL: {}", url);
+        
+        println!("Downloading Python from: {}", url);
+        self.download_and_extract(&client, url, &runtime_dir, "py3.11.9_amd64.zip", false)?;
 
-        self.download_and_extract(&client, url, runtime_dir, "py3.11.9_amd64.zip", false)?;
-
-        // Rename the decompressed directory to python (no longer nested)
-        let extracted_dir = runtime_dir.join("py3.11.9_amd64");  // Temporary directory after decompression
-        let final_dir = runtime_dir.join("python");  // Target directory is python
-
-        // If the target directory already exists, delete it (to prevent renaming failure)
-        if final_dir.exists() {
-            fs::remove_dir_all(&final_dir).map_err(|e| format!("Failed to remove existing python directory: {}", e))?;
+        // Check target directory again before renaming
+        if python_dir.exists() {
+            println!("Removing existing Python directory before rename");
+            fs::remove_dir_all(&python_dir)
+                .map_err(|e| format!("Failed to remove existing python directory: {}", e))?;
         }
 
-        // Rename the decompressed directory to python, the decompressed files will be directly placed in runtime\\python
-        if let Err(e) = fs::rename(extracted_dir, final_dir) {
-            return Err(format!("Failed to rename extracted directory: {}", e));
+        // Ensure source directory exists
+        if !extracted_dir.exists() {
+            return Err("Extracted directory not found".to_string());
         }
 
-        // The final path should be runtime\\python\\python.exe
-        Ok(())  // Return success
+        // Rename directory
+        println!("Renaming {} to {}", extracted_dir.display(), python_dir.display());
+        if let Err(e) = fs::rename(&extracted_dir, &python_dir) {
+            return Err(format!("Failed to rename directory: {} (Error: {})", extracted_dir.display(), e));
+        }
+
+        println!("Python installation completed successfully");
+        Ok(())
     }
     pub fn install_nu_shell(&self, force: bool) -> Result<(), String> {
         // If it already exists and is not forced to download, return success
@@ -122,11 +134,6 @@ impl ScriptExecutor {
             if !config_file.exists() {
                 File::create(config_file)
                     .map_err(|e| format!("Error creating config file: {}", e))?;
-                
-                // Set file permissions on Unix systems
-                #[cfg(unix)]
-                std::fs::set_permissions(config_file, std::fs::Permissions::from_mode(0o744))
-                    .map_err(|e| format!("Error setting permissions: {}", e))?;
             }
         }
 
@@ -273,39 +280,57 @@ impl ScriptExecutor {
             .map_err(|e| format!("Failed to create temporary file: {}", e))?;
 
         // 3. Write script content
+        let bom = vec![0xEF, 0xBB, 0xBF];//Add UTF-8 BOM mark
         temp_file.as_file()
-            .write_all(code.as_bytes())
+            .write_all(&bom)
+            .map_err(|e| format!("Failed to write BOM: {}", e))?;
+        let script_content = if shell == "nushell" {
+            format!("#!nushell\n{}", code)
+        } else {
+            code.to_string()
+        };
+        temp_file.as_file()
+            .write_all(script_content.as_bytes())
             .map_err(|e| format!("Failed to write script content: {}", e))?;
         // 4. Convert to PathBuf and return
         let script_path = temp_file.into_temp_path();
         println!("path is {}", script_path.display());
         // Create a binding to extend the temporary value's lifetime
         let path_string = script_path.to_string_lossy();
-        let final_path = path_string.to_string().replace("C:", "C:\\");
+        let final_path = if path_string.contains(' ') {
+            format!("\"{}\"", path_string.replace("C:", "C:\\"))
+        } else {
+            path_string.replace("C:", "C:\\")
+        };
 
         // Print the final path for debugging
         println!("Final path for Deno script: {}", final_path);
 
         // Prepare execution parameters for different shells
         let (exe, cmd_args) = match shell {
-            "powershell" => (
-                "powershell.exe",
-                vec![
-                    "-NonInteractive".to_string(),
-                    "-NoProfile".to_string(),
-                    "-ExecutionPolicy".to_string(),
-                    "Bypass".to_string(),
-                    final_path.to_string(),
-                ]
-            ),
-            "python" => (
-                self.config.py_bin.as_str(),
-                vec![final_path.to_string()]
-            ),
-            "cmd" => (
-                final_path.as_ref(),
-                Vec::new()
-            ),
+            "python" => {
+                // For Python, use the path directly without additional quotes
+                let script_path = path_string.replace("C:", "C:\\");
+                (
+                    self.config.py_bin.as_str(),
+                    vec![script_path]
+                )
+            },
+            "powershell" => {
+                // Simplify path handling
+                let script_path = path_string.replace("C:", "C:\\");
+                (
+                    "powershell.exe",
+                    vec![
+                        "-NonInteractive".to_string(),
+                        "-NoProfile".to_string(),
+                        "-ExecutionPolicy".to_string(),
+                        "Bypass".to_string(),
+                        "-File".to_string(),
+                        script_path,
+                    ]
+                )
+            },
             "nushell" => {
                 if !Path::new(&self.config.nu_bin).exists() {
                     return Err("Nushell executable not found".to_string());
@@ -318,30 +343,36 @@ impl ScriptExecutor {
                         format!("{}/etc/nushell/env.nu", self.config.program_dir),
                     ]
                 } else {
-                    vec!["--no-config-file".to_string()]
+                    vec![]
                 };
-                nushell_args.push(final_path.to_string());
+                
+                nushell_args.extend(vec![
+                    "-c".to_string(),
+                    code.to_string(),
+                ]);
+                
                 (self.config.nu_bin.as_str(), nushell_args)
             },
             "deno" => {
                 if !Path::new(&self.config.deno_bin).exists() {
                     return Err("Deno executable not found".to_string());
                 }
-
+                let script_path = path_string.replace("C:", "C:\\");
                 let mut deno_args = vec![
                     "run".to_string(),
                     "--no-prompt".to_string(),
-                    "--allow-all".to_string(), // Keep only this one if you want all permissions
-                    final_path.to_string(),
+                    "--allow-all".to_string(),
+                    script_path,
                 ];
-                // Add additional parameters
                 deno_args.extend(args);
                 // Output the complete command executed by deno, for debugging
                 println!("Executing command: {} {:?}", self.config.deno_bin.as_str(), deno_args);
                 (self.config.deno_bin.as_str(), deno_args)
             },
-
-
+            "cmd" => (
+                final_path.as_ref(),
+                Vec::new()
+            ),
             _ => return Err(format!("Unsupported script type: {}", shell)),
         };
 
@@ -392,39 +423,38 @@ impl ScriptExecutor {
 
         // Handle timeout and output
         let output = if timeout > 0 {
-            // Use wait_timeout to handle timeout
             match child.wait_timeout(Duration::from_secs(timeout as u64)) {
                 Ok(Some(status)) => {
-                    // Process ends normally, get output
-                    let mut stdout = String::new();
-                    let mut stderr = String::new();
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
 
                     if let Some(mut stdout_pipe) = child.stdout.take() {
-                        stdout_pipe.read_to_string(&mut stdout)
+                        stdout_pipe.read_to_end(&mut stdout)
                             .map_err(|e| format!("Failed to read standard output: {}", e))?;
                     }
 
                     if let Some(mut stderr_pipe) = child.stderr.take() {
-                        stderr_pipe.read_to_string(&mut stderr)
+                        stderr_pipe.read_to_end(&mut stderr)
                             .map_err(|e| format!("Failed to read error output: {}", e))?;
                     }
 
-                    (stdout, stderr, status.code().unwrap_or(1))
+                    let stdout_str = String::from_utf8_lossy(&stdout).into_owned();
+                    let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+
+                    (stdout_str, stderr_str, status.code().unwrap_or(1))
                 },
                 Ok(None) => {
-                    // Timeout
                     child.kill().ok();
                     return Err("Process execution timeout".to_string());
                 },
                 Err(e) => return Err(format!("Failed to wait for process: {}", e)),
             }
         } else {
-            // No timeout limit
             let output = child.wait_with_output()
                 .map_err(|e| format!("Failed to get process output: {}", e))?;
 
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let exit_code = output.status.code().unwrap_or(1);
 
             (stdout, stderr, exit_code)
@@ -441,8 +471,8 @@ impl ScriptExecutor {
         asset_name: &str,
         _use_temp_dir: bool,
     ) -> Result<(), String> {
-        println!("Downloading to directory: {:?}", dest_dir);
         let asset_path = dest_dir.join(asset_name);
+        println!("Downloading to: {}", asset_path.display());
 
         // Download file
         let mut response = client.get(url)
@@ -450,46 +480,34 @@ impl ScriptExecutor {
             .map_err(|e| format!("Download failed: {}", e))?;
 
         if !response.status().is_success() {
-            return Err(format!("Download failed, status code: {}", response.status()));
+            return Err(format!("Download failed with status: {}", response.status()));
         }
 
+        // Save file
         let mut file = File::create(&asset_path)
             .map_err(|e| format!("Failed to create file: {}", e))?;
+        
         response.copy_to(&mut file)
-            .map_err(|e| format!("Failed to save downloaded file: {}", e))?;
+            .map_err(|e| format!("Failed to save file: {}", e))?;
 
-        // Print the contents of the directory before unzipping
-        println!("Directory contents before unzip:");
-        if let Ok(entries) = fs::read_dir(dest_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    println!("  {:?}", entry.path());
-                }
-            }
-        }
-
-        // Unzip
+        // Extract file
+        println!("Extracting file: {}", asset_path.display());
         self.unzip(&asset_path, dest_dir.to_str().unwrap())?;
 
-        // Print the contents of the directory after unzipping
-        println!("Directory contents after unzip:");
-        if let Ok(entries) = fs::read_dir(dest_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    println!("  {:?}", entry.path());
-                }
-            }
+        // Remove zip file
+        println!("Removing zip file");
+        if let Err(e) = fs::remove_file(&asset_path) {
+            println!("Warning: Failed to remove zip file: {}", e);
+            // Do not interrupt the entire process due to clean_up failure
         }
-
-        // Delete the zip file
-        fs::remove_file(&asset_path)
-            .map_err(|e| format!("Failed to delete zip file: {}", e))?;
 
         Ok(())
     }
     
     // Add a new auxiliary method to check the script environment
     fn check_script_environment(&self, shell: &str) -> Result<(), String> {
+        println!("Checking and installing necessary script environments...");
+        
         match shell {
             "python" => {
                 if !Path::new(&self.config.py_bin).exists() {
@@ -539,6 +557,47 @@ impl ScriptExecutor {
                 .map_err(|e| format!("Failed to create HTTP client: {}", e))?
         };
         Ok(client)
+    }
+
+    pub fn install_choco(&self) -> Result<bool, String> {
+        println!("Starting Chocolatey installation...");
+        
+        // Create HTTP  
+        let client = self.create_http_client()?;
+
+        // Download Chocolatey installation script
+        println!("Downloading Chocolatey installation script...");
+        let response = client.get("https://chocolatey.org/install.ps1")
+            .send()
+            .map_err(|e| format!("Failed to download Chocolatey script: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Failed to download Chocolatey script, status: {}", response.status()));
+        }
+
+        let script = response.text()
+            .map_err(|e| format!("Failed to read response text: {}", e))?;
+
+        // Execute installation script
+        println!("Executing Chocolatey installation script...");
+        let (stdout, stderr, exit_code) = self.run_script(
+            &script,
+            "powershell",
+            vec![],
+            900,  //15 minutes timeout
+            false,
+            vec![],
+            false
+        )?;
+
+        if exit_code != 0 {
+            println!("Installation stdout: {}", stdout);
+            println!("Installation stderr: {}", stderr);
+            return Err(format!("Chocolatey installation failed with exit code: {}", exit_code));
+        }
+
+        println!("Chocolatey installation completed successfully");
+        Ok(true)
     }
 }
 
@@ -722,9 +781,45 @@ mod tests {
         // Clean up environment (can be cleaned up again here)
         cleanup_test_environment().expect("Failed to clean up temporary directories");
     }
+
+    #[test]
+    fn test_install_choco() {
+        let config = AgentConfig::default();
+        let executor = ScriptExecutor::new(config);
+
+        println!("=== Testing Chocolatey installation ===");
+        match executor.install_choco() {
+            Ok(result) => {
+                assert!(result, "Chocolatey installation should return true on success");
+                println!("Chocolatey installation test passed");
+            },
+            Err(e) => {
+                panic!("Chocolatey installation failed: {}", e);
+            }
+        }
+
+        // Verify Chocolatey installation
+        let (stdout, stderr, exit_code) = executor.run_script(
+            r#"
+            $chocoPath = "$env:ProgramData\chocolatey\bin\choco.exe"
+            if (Test-Path $chocoPath) {
+                & $chocoPath --version
+            } else {
+                Write-Error "Chocolatey not found at expected path: $chocoPath"
+                exit 1
+            }
+            "#,
+            "powershell",
+            vec![],
+            30,
+            false,
+            vec![],
+            false,
+        ).expect("Failed to check Chocolatey version");
+
+        println!("Chocolatey version check output: {}", stdout);
+        println!("Chocolatey version check error: {}", stderr);
+        assert_eq!(exit_code, 0, "Chocolatey version check should succeed");
+        assert!(!stdout.trim().is_empty(), "Chocolatey version should not be empty");
+    }
 }
-
-
-
-
-

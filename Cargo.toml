@@ -10,7 +10,6 @@ reqwest = { version = "0.11", features = ["blocking", "socks", "native-tls-vendo
 rand = "0.8"
 zip = "0.6"
 tempfile = "3.8"
-defer = "0.1"
 wait-timeout = "0.2"
 windows-sys = { version = "0.48", features = [
     "Win32_Foundation",
@@ -23,9 +22,6 @@ windows-sys = { version = "0.48", features = [
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
-lazy_static = "1.4"
 winreg = "0.50"
 windows = { version = "0.58.0", features = ["Win32_System_SystemInformation"] }
 
-[target.'cfg(unix)'.dependencies]
-# Unix 系统特定的权限设置依赖（如果需要）
